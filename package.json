@@ -1,0 +1,12 @@
+{
+  "name": "telegram-download-bot",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@distube/ytdl-core": "^4.16.9",
+    "form-data": "^4.0.1"
+  }
+}
