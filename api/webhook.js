@@ -2,9 +2,14 @@ const FormData = require('form-data');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
+const PASSWORD = 'Abdulloh29';
 
 const INSTAGRAM_RE = /(?:https?:\/\/)?(?:www\.)?instagram\.com\/(?:p|reel|reels|tv)\/([a-zA-Z0-9_-]+)/i;
 const YOUTUBE_RE = /(?:https?:\/\/)?(?:(?:www|m)\.)?(?:youtube\.com\/(?:watch\?.*v=|shorts\/|embed\/)|youtu\.be\/)([a-zA-Z0-9_-]+)/i;
+
+// In-memory state (persists across warm serverless invocations)
+const authorizedUsers = new Set();
+const pendingLinks = new Map(); // chatId -> youtubeUrl
 
 // --- Telegram helpers ---
 
@@ -25,13 +30,26 @@ function sendAction(chatId, action) {
   return tg('sendChatAction', { chat_id: chatId, action });
 }
 
+// --- YouTube agent with cookies (fixes "Sign in to confirm you're not a bot") ---
+
+function getYtdlOptions() {
+  const ytdl = require('@distube/ytdl-core');
+  const opts = {};
+  if (process.env.YT_COOKIES) {
+    try {
+      opts.agent = ytdl.createAgent(JSON.parse(process.env.YT_COOKIES));
+    } catch (e) {
+      console.error('Failed to create ytdl agent from YT_COOKIES:', e.message);
+    }
+  }
+  return opts;
+}
+
 // --- Instagram extraction via oembed API ---
 
 async function extractInstagram(url) {
-  // Clean URL (remove tracking params)
   const cleanUrl = url.split('?')[0];
 
-  // Method 1: oembed API (most reliable for public posts)
   try {
     const oembedUrl = `https://i.instagram.com/api/v1/oembed/?url=${encodeURIComponent(cleanUrl)}`;
     const res = await fetch(oembedUrl);
@@ -50,7 +68,6 @@ async function extractInstagram(url) {
     console.error('IG oembed failed:', e.message);
   }
 
-  // Method 2: scrape page for og: tags (fallback)
   const headers = {
     'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
     'Accept': 'text/html',
@@ -76,26 +93,35 @@ async function extractInstagram(url) {
 
 // --- YouTube extraction ---
 
-async function extractYouTube(url) {
+async function extractYouTube(url, format) {
   const ytdl = require('@distube/ytdl-core');
-  const info = await ytdl.getInfo(url);
+  const opts = getYtdlOptions();
+  const info = await ytdl.getInfo(url, opts);
   const title = info.videoDetails.title;
 
+  if (format === 'audio') {
+    const formats = info.formats
+      .filter(f => f.hasAudio && !f.hasVideo)
+      .sort((a, b) => (b.audioBitrate || 0) - (a.audioBitrate || 0));
+
+    let fmt = formats.find(f => f.contentLength && parseInt(f.contentLength) < 50 * 1024 * 1024);
+    if (!fmt) fmt = formats[0];
+    if (!fmt) return null;
+
+    return { type: 'audio', url: fmt.url, title, size: parseInt(fmt.contentLength || '0') };
+  }
+
+  // Video format
   const formats = info.formats
     .filter(f => f.hasVideo && f.hasAudio)
     .sort((a, b) => (a.height || 0) - (b.height || 0));
 
-  let format = formats.find(f => f.height <= 720 && f.contentLength && parseInt(f.contentLength) < 50 * 1024 * 1024);
-  if (!format) format = formats.find(f => f.height <= 480);
-  if (!format) format = formats[0];
-  if (!format) return null;
+  let fmt = formats.find(f => f.height <= 720 && f.contentLength && parseInt(f.contentLength) < 50 * 1024 * 1024);
+  if (!fmt) fmt = formats.find(f => f.height <= 480);
+  if (!fmt) fmt = formats[0];
+  if (!fmt) return null;
 
-  return {
-    type: 'video',
-    url: format.url,
-    title,
-    size: parseInt(format.contentLength || '0'),
-  };
+  return { type: 'video', url: fmt.url, title, size: parseInt(fmt.contentLength || '0') };
 }
 
 // --- Download media buffer and upload to Telegram ---
@@ -115,14 +141,28 @@ async function downloadAndSend(chatId, mediaUrl, type, caption) {
   const form = new FormData();
   form.append('chat_id', chatId.toString());
 
-  const method = type === 'video' ? 'sendVideo' : 'sendPhoto';
-  const field = type === 'video' ? 'video' : 'photo';
-  const ext = type === 'video' ? 'mp4' : 'jpg';
-  const mime = type === 'video' ? 'video/mp4' : 'image/jpeg';
+  let method, field, ext, mime;
+  if (type === 'audio') {
+    method = 'sendAudio';
+    field = 'audio';
+    ext = 'mp3';
+    mime = 'audio/mpeg';
+  } else if (type === 'video') {
+    method = 'sendVideo';
+    field = 'video';
+    ext = 'mp4';
+    mime = 'video/mp4';
+  } else {
+    method = 'sendPhoto';
+    field = 'photo';
+    ext = 'jpg';
+    mime = 'image/jpeg';
+  }
 
   form.append(field, buffer, { filename: `media.${ext}`, contentType: mime });
   if (caption) form.append('caption', caption.slice(0, 1024));
   if (type === 'video') form.append('supports_streaming', 'true');
+  if (type === 'audio') form.append('title', (caption || 'audio').slice(0, 256));
 
   const result = await fetch(`${TELEGRAM_API}/${method}`, {
     method: 'POST',
@@ -140,7 +180,48 @@ module.exports = async (req, res) => {
     return res.status(200).json({ ok: true, message: 'Bot is running' });
   }
 
-  const { message } = req.body || {};
+  const { message, callback_query } = req.body || {};
+
+  // --- Handle callback queries (YouTube format selection) ---
+  if (callback_query) {
+    const cbChatId = callback_query.message.chat.id;
+    const cbData = callback_query.data;
+
+    await tg('answerCallbackQuery', { callback_query_id: callback_query.id });
+
+    const url = pendingLinks.get(cbChatId);
+    if (!url) {
+      await sendMsg(cbChatId, 'Session expired. Please send the link again.');
+      return res.status(200).json({ ok: true });
+    }
+
+    pendingLinks.delete(cbChatId);
+
+    if (cbData === 'yt_video' || cbData === 'yt_audio') {
+      const format = cbData === 'yt_audio' ? 'audio' : 'video';
+      await sendAction(cbChatId, format === 'audio' ? 'upload_document' : 'upload_video');
+      await sendMsg(cbChatId, `Downloading ${format}...`);
+
+      try {
+        const media = await extractYouTube(url, format);
+        if (!media) {
+          await sendMsg(cbChatId, 'Could not extract media from this link.');
+          return res.status(200).json({ ok: true });
+        }
+
+        const result = await downloadAndSend(cbChatId, media.url, media.type, media.title);
+        if (!result.ok) {
+          await sendMsg(cbChatId, `<b>${media.title}</b>\n\nFile too large (Telegram 50MB limit).`);
+        }
+      } catch (e) {
+        await sendMsg(cbChatId, `Error: ${e.message}`);
+      }
+    }
+
+    return res.status(200).json({ ok: true });
+  }
+
+  // --- Handle messages ---
   if (!message?.text) return res.status(200).json({ ok: true });
 
   const chatId = message.chat.id;
@@ -149,7 +230,20 @@ module.exports = async (req, res) => {
   try {
     // /start
     if (text === '/start') {
-      await sendMsg(chatId, '<b>Welcome!</b>\n\nSend me a YouTube or Instagram link and I\'ll download it for you.');
+      await sendMsg(chatId, 'Please enter the password to use this bot:');
+      return res.status(200).json({ ok: true });
+    }
+
+    // Password check
+    if (text === PASSWORD) {
+      authorizedUsers.add(chatId);
+      await sendMsg(chatId, '<b>Access granted!</b>\n\nSend me a YouTube or Instagram link and I\'ll download it for you.');
+      return res.status(200).json({ ok: true });
+    }
+
+    // Authorization check
+    if (!authorizedUsers.has(chatId)) {
+      await sendMsg(chatId, 'Please enter the correct password first.\nSend /start to begin.');
       return res.status(200).json({ ok: true });
     }
 
@@ -168,7 +262,6 @@ module.exports = async (req, res) => {
         ? `${media.title ? media.title.slice(0, 200) + '\n\n' : ''}@${media.author} on Instagram`
         : 'Downloaded from Instagram';
 
-      // Try sending by URL first (works for Instagram CDN URLs)
       const field = media.type === 'video' ? 'video' : 'photo';
       const method = media.type === 'video' ? 'sendVideo' : 'sendPhoto';
       const urlResult = await tg(method, {
@@ -178,7 +271,6 @@ module.exports = async (req, res) => {
       });
 
       if (!urlResult.ok) {
-        // Fallback: download and re-upload
         try {
           const uploadResult = await downloadAndSend(chatId, media.url, media.type, caption);
           if (!uploadResult.ok) {
@@ -194,24 +286,17 @@ module.exports = async (req, res) => {
 
     // --- YouTube ---
     if (YOUTUBE_RE.test(text)) {
-      await sendAction(chatId, 'upload_video');
-      await sendMsg(chatId, 'Processing YouTube link...');
-
-      const media = await extractYouTube(text);
-      if (!media) {
-        await sendMsg(chatId, 'Could not extract video from this link.');
-        return res.status(200).json({ ok: true });
-      }
-
-      try {
-        const result = await downloadAndSend(chatId, media.url, 'video', media.title);
-        if (!result.ok) {
-          await sendMsg(chatId, `<b>${media.title}</b>\n\nVideo is too large (Telegram 50MB limit).`);
-        }
-      } catch (e) {
-        await sendMsg(chatId, `<b>${media.title}</b>\n\nError: ${e.message}`);
-      }
-
+      pendingLinks.set(chatId, text);
+      await tg('sendMessage', {
+        chat_id: chatId,
+        text: 'Choose download format:',
+        reply_markup: {
+          inline_keyboard: [[
+            { text: 'Video', callback_data: 'yt_video' },
+            { text: 'Audio', callback_data: 'yt_audio' },
+          ]],
+        },
+      });
       return res.status(200).json({ ok: true });
     }
 
